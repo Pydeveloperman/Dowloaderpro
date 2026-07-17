@@ -74,7 +74,7 @@ deno --version
 ## ▶️ Ishga tushirish
 
 ```bash
-python b2.py
+python Panel.py
 ```
 
 Oyna ochilgach, uchta tabdan birini tanlang:
@@ -134,7 +134,7 @@ Agar bu buyruq ishласа, dastur ham ishlaydi — chunki u xuddi shu sozlamala
 ## 📁 Loyiha tuzilishi
 
 ```
-b2.py                                    # Asosiy dastur fayli
+Panel.py                                    # Asosiy dastur fayli
 ~/.video_yuklovchi_sozlamalar.json       # Saqlangan sozlamalar (avtomatik yaratiladi)
 ```
 
