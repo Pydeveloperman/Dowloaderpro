@@ -74,7 +74,7 @@ deno --version
 ## ▶️ Ishga tushirish
 
 ```bash
-python b2.py
+python Pyside6/Panel.py
 ```
 
 Oyna ochilgach, uchta tabdan birini tanlang:
