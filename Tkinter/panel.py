@@ -30,16 +30,29 @@ Ishga tushirish:
 """
 
 import os
-import sys
+import re
+import io
 import json
 import queue
+import shutil
 import threading
+import urllib.request
+import urllib.error
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 import yt_dlp
+
+# Video-thumbnail (rasm) oldindan ko'rsatish uchun Pillow ixtiyoriy —
+# o'rnatilmagan bo'lsa dastur baribir ishlayveradi, faqat thumbnail
+# ko'rinmaydi va o'rniga tushunarli izoh chiqadi.
+try:
+    from PIL import Image, ImageTk
+    PILLOW_MAVJUD = True
+except ImportError:
+    PILLOW_MAVJUD = False
 
 
 SOZLAMALAR_FAYLI = os.path.join(os.path.expanduser("~"), ".video_yuklovchi_sozlamalar.json")
@@ -57,7 +70,7 @@ ASOSIY_YDL_SOZLAMALARI = {
     # skriptlarni GitHub'dan yuklab olishga ruxsat berilgan bo'lishi kerak
     # (aks holda faqat rasm-formatlar ko'rinadi, video/audio yo'q bo'lib
     # qoladi). Shu sabab bu yerda doimiy yoqib qo'yilgan:
-    "remote_components": ["ejs:github"],
+    "remote_components": {"ejs:github"},
     # Eslatma: cookiesfrombrowser bu yerda statik yozilmagan. YouTube
     # so'rovni "bot" deb bloklasa, dastur pastdagi _ydl_bilan_bajarish()
     # funksiyasi orqali kompyuterdagi brauzerlar (Chrome, Firefox, Edge...)
@@ -124,13 +137,22 @@ def format_yorlig_yasash(f):
     if not videosi_bor and not audiosi_bor:
         return None  # storyboard yoki boshqa foydasiz format
 
-    format_id = f.get("format_id", "?")
+    format_id = f.get("format_id") or f.get("ext") or "auto"
     ext = f.get("ext", "?")
     hajm = hajmni_formatlash(f.get("filesize") or f.get("filesize_approx"))
 
     if videosi_bor:
         balandlik = f.get("height")
         kenglik = f.get("width")
+        # Ba'zi platformalar (masalan TikTok/Instagram) height/width
+        # o'rniga faqat "resolution": "1080x1920" ko'rinishidagi matnni
+        # beradi — shundan ham o'lchamni chiqarib olishga urinamiz.
+        if not balandlik and not kenglik:
+            oloshuv = f.get("resolution") or ""
+            if "x" in oloshuv:
+                bo_laklar = oloshuv.lower().split("x")
+                if len(bo_laklar) == 2 and bo_laklar[1].strip().isdigit():
+                    balandlik = int(bo_laklar[1].strip())
         fps = f.get("fps")
         if balandlik:
             olcham = f"{balandlik}p" + (f"{int(fps)}" if fps and fps != 30 else "")
@@ -163,10 +185,28 @@ def format_yorlig_yasash(f):
 def barcha_formatlarni_tayyorla(malumot):
     """extract_info natijasidagi barcha formatlarni tartiblab, combobox uchun
     ro'yxat (avtomatik eng yaxshi + har bir format + MP3 audio) qaytaradi."""
-    xom_formatlar = malumot.get("formats") or []
+    xom_formatlar = list(malumot.get("formats") or [])
+
     tayyorlangan = []
+    korilgan_idlar = set()
     for f in xom_formatlar:
         yorliq = format_yorlig_yasash(f)
+        if yorliq and yorliq["format_id"] not in korilgan_idlar:
+            tayyorlangan.append(yorliq)
+            korilgan_idlar.add(yorliq["format_id"])
+
+    # MUHIM XATO TUZATILDI: YouTube'dan farqli ko'plab platformalar
+    # (Instagram, TikTok, Facebook, X/Twitter va h.k.) har doim ham
+    # bir nechta sifat variantini alohida 'formats' ro'yxatida
+    # qaytaravermaydi — ko'pincha faqat bitta tayyor video havolasini
+    # to'g'ridan-to'g'ri ma'lumot lug'atining o'zida ('url', 'ext',
+    # 'vcodec' kabi maydonlar orqali) beradi. Aynan shu sabab bunday
+    # platformalarda "sifat" ro'yxati bo'sh chiqib, foydalanuvchi hech
+    # qanday tanlov ko'rmas edi. Endi 'formats' bo'sh bo'lsa (yoki
+    # ichidagilar storyboard bo'lib chiqib, hammasi filtrlanib ketsa),
+    # ma'lumotning o'zidan yagona formatni yasab, ro'yxatga qo'shamiz.
+    if not tayyorlangan and malumot.get("url"):
+        yorliq = format_yorlig_yasash(malumot)
         if yorliq:
             tayyorlangan.append(yorliq)
 
@@ -211,6 +251,19 @@ def xatolik_izohi(xato):
         return "Juda ko'p so'rov yuborildi. Bir necha daqiqadan so'ng qayta urinib ko'ring."
     if "Unsupported URL" in matn:
         return "Bu havola qo'llab-quvvatlanmaydi yoki noto'g'ri kiritilgan."
+    if "ffmpeg not found" in matn or "ffprobe and ffmpeg not found" in matn or "requires ffmpeg" in matn.lower():
+        return (
+            "ffmpeg kompyuterda topilmadi. MP3'ga o'tkazish yoki video+audio "
+            "birlashtirish uchun ffmpeg kerak.\n"
+            "O'rnatish: Linux — sudo apt install ffmpeg | Mac — brew install ffmpeg | "
+            "Windows — ffmpeg.org'dan yuklab PATH'ga qo'shing."
+        )
+    if "No JS runtime" in matn or "no supported JavaScript runtime" in matn.lower():
+        return (
+            "JavaScript runtime (Deno) topilmadi — YouTube formatlarini to'liq "
+            "ochish uchun kerak.\n"
+            "O'rnatish: curl -fsSL https://deno.land/install.sh | sh"
+        )
     return matn
 
 
@@ -278,6 +331,19 @@ _SINALADIGAN_BROUZERLAR = ["chrome", "edge", "firefox", "brave", "chromium", "vi
 # Bror brauzer nomi — o'sha ishlagani va endi doim shu ishlatiladi.
 # None — barcha brauzerlar sinalgan, lekin birortasi ham ishlamagan.
 _ishlaydigan_brouzer = "ANIQLANMAGAN"
+
+# Foydalanuvchi "Bekor qilish" tugmasini bosganda shu Event o'rnatiladi —
+# progress_hook uni tekshirib, yt-dlp'ga yuklashni to'xtatishni buyuradi.
+_bekor_bayrogi = threading.Event()
+
+
+def bekor_qilishni_sorash():
+    _bekor_bayrogi.set()
+
+
+def bekor_bayrogini_tozalash():
+    _bekor_bayrogi.clear()
+
 
 # Foydalanuvchi UI orqali qo'lda ko'rsatgan cookies.txt fayli yo'li (bo'lsa).
 # Bu ayniqsa Linux'da Snap orqali o'rnatilgan Chrome/Chromium/Firefox uchun
@@ -395,27 +461,62 @@ def vazifa_malumot_olish(signallar, url):
 
 def _progress_hook_yasash(signallar):
     def hook(d):
+        if _bekor_bayrogi.is_set():
+            # yt-dlp shu maxsus xatoni kutadi — uni ko'rganda yuklashni
+            # darhol, toza tarzda to'xtatadi.
+            raise yt_dlp.utils.DownloadCancelled("Foydalanuvchi bekor qildi.")
+
+        info = d.get("info_dict") or {}
+        pleylist_indeks = info.get("playlist_index")
+        pleylist_soni = info.get("playlist_count") or info.get("n_entries")
+        pleylist_prefiks = ""
+        if pleylist_indeks and pleylist_soni:
+            pleylist_prefiks = f"[{pleylist_indeks}/{pleylist_soni}] "
+
         if d["status"] == "downloading":
             foiz_str = (d.get("_percent_str") or "0%").strip().replace("%", "")
+            # yt-dlp foiz matniga ba'zan ANSI-rang kodlarini ham qo'shib
+            # yuborishi mumkin — shularni tozalab, faqat raqamni qoldiramiz.
+            foiz_toza = re.sub(r"[^0-9.]", "", foiz_str)
             try:
-                foiz = float(foiz_str)
+                foiz = float(foiz_toza) if foiz_toza else 0.0
             except ValueError:
-                foiz = 0
+                foiz = 0.0
             signallar.progress(foiz)
             tezlik = (d.get("_speed_str") or "").strip()
-            signallar.holat(f"Yuklanmoqda: {foiz_str}%  |  Tezlik: {tezlik}")
+
+            # So'ralgan yangi funksiya: qancha yuklangani (hajm bo'yicha)
+            # ham holat qatorida ko'rsatiladi, faqat foiz emas.
+            yuklangan = d.get("downloaded_bytes")
+            jami = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if yuklangan is not None and jami:
+                hajm_matn = f"  |  {hajmni_formatlash(yuklangan)} / {hajmni_formatlash(jami)}"
+            elif yuklangan is not None:
+                hajm_matn = f"  |  {hajmni_formatlash(yuklangan)} yuklandi"
+            else:
+                hajm_matn = ""
+
+            qolgan = (d.get("_eta_str") or "").strip()
+            qolgan_matn = f"  |  Qoldi: {qolgan}" if qolgan and qolgan != "Unknown" else ""
+
+            signallar.holat(
+                f"{pleylist_prefiks}Yuklanmoqda: {foiz_toza or '0'}%{hajm_matn}  |  "
+                f"Tezlik: {tezlik or 'nomalum'}{qolgan_matn}"
+            )
         elif d["status"] == "finished":
-            signallar.holat("Yuklab olindi, qayta ishlanmoqda (ffmpeg)...")
+            signallar.holat(f"{pleylist_prefiks}Yuklab olindi, qayta ishlanmoqda (ffmpeg)...")
             signallar.progress(100)
     return hook
 
 
-def vazifa_url_yuklash(signallar, url, tanlangan, papka):
+def vazifa_url_yuklash(signallar, url, tanlangan, papka, subtitr_sozlama=None):
     try:
         asosiy_sozlama = {
             "outtmpl": os.path.join(papka, "%(title)s.%(ext)s"),
             "progress_hooks": [_progress_hook_yasash(signallar)],
         }
+        if subtitr_sozlama:
+            asosiy_sozlama.update(subtitr_sozlama)
 
         if tanlangan["kind"] == "mp3":
             sozlamalar = {
@@ -467,15 +568,21 @@ def vazifa_url_yuklash(signallar, url, tanlangan, papka):
             else:
                 raise
         signallar.tugadi(f"Tayyor! '{papka}' papkasiga saqlandi.")
+    except yt_dlp.utils.DownloadCancelled:
+        signallar.holat("Yuklash bekor qilindi.")
+        signallar.tugadi("Yuklash bekor qilindi.")
     except Exception as xato:
         signallar.xato(xatolik_izohi(xato))
         signallar.holat("Yuklashda xatolik.")
 
 
-def vazifa_pleylist_yuklash(signallar, url, sifat_matn, papka):
+def vazifa_pleylist_yuklash(signallar, url, sifat_matn, papka, subtitr_sozlama=None):
     pleylist_papka = os.path.join(papka, "%(playlist_title)s")
     try:
-        if sifat_matn.startswith("Faqat audio"):
+        variant = PLEYLIST_SIFAT_VARIANTLARI.get(
+            sifat_matn, PLEYLIST_SIFAT_VARIANTLARI["720p (HD)"]
+        )
+        if variant["faqat_audio"]:
             sozlamalar = {
                 "format": "bestaudio/best",
                 "outtmpl": os.path.join(pleylist_papka, "%(title)s.%(ext)s"),
@@ -485,7 +592,7 @@ def vazifa_pleylist_yuklash(signallar, url, sifat_matn, papka):
                 }],
             }
         else:
-            balandlik = int(sifat_matn.split("p")[0])
+            balandlik = variant["balandlik"]
             sozlamalar = {
                 "format": f"bestvideo[height<={balandlik}]+bestaudio/best[height<={balandlik}]",
                 "outtmpl": os.path.join(pleylist_papka, "%(title)s.%(ext)s"),
@@ -493,14 +600,64 @@ def vazifa_pleylist_yuklash(signallar, url, sifat_matn, papka):
                 "merge_output_format": "mp4",
             }
 
+        if subtitr_sozlama:
+            sozlamalar.update(subtitr_sozlama)
         sozlamalar["ignoreerrors"] = "only_download"
 
         signallar.holat("Pleylist yuklanmoqda, biroz vaqt olishi mumkin...")
         _ydl_bilan_bajarish(sozlamalar, lambda ydl: ydl.download([url]))
         signallar.tugadi(f"Pleylist to'liq yuklandi! '{papka}' papkasini tekshiring.")
+    except yt_dlp.utils.DownloadCancelled:
+        signallar.holat("Pleylist yuklash bekor qilindi.")
+        signallar.tugadi("Pleylist yuklash bekor qilindi.")
     except Exception as xato:
         signallar.xato(xatolik_izohi(xato))
         signallar.holat("Pleylist yuklashda xatolik.")
+
+
+# Faqat shu amal turlari haqiqatan "Bekor qilish" tugmasi bilan
+# to'xtatilishi mumkin, chunki ular progress_hook orqali ishlaydi.
+BEKOR_QILINADIGAN_AMALLAR = {"yuklash", "pleylist_yuklash", "kop_url_yuklash"}
+
+
+# Pleylist sifat combobox'idagi ko'rsatiladigan matn -> haqiqiy qiymat.
+# Matnni keyin "1080p".split("p") kabi mo'rt tarzda parslash o'rniga,
+# shu lug'atdan to'g'ridan-to'g'ri qiymat olinadi.
+PLEYLIST_SIFAT_VARIANTLARI = {
+    "1080p (Full HD)": {"balandlik": 1080, "faqat_audio": False},
+    "720p (HD)": {"balandlik": 720, "faqat_audio": False},
+    "480p (O'rta sifat)": {"balandlik": 480, "faqat_audio": False},
+    "Faqat audio (MP3)": {"balandlik": None, "faqat_audio": True},
+}
+
+
+# Subtitr (subtitle) tanlash uchun ko'rsatiladigan matn -> yt-dlp til kodi.
+SUBTITR_TILLARI = {
+    "O'zbek": "uz",
+    "Ingliz": "en",
+    "Rus": "ru",
+    "Barcha mavjud tillar": "all",
+}
+
+
+def _subtitr_ydl_sozlamalarini_yasash(subtitr_yoqilgan, til_matni):
+    """Subtitr checkbox va til tanloviga qarab yt-dlp'ga qo'shiladigan
+    qo'shimcha sozlamalarni qaytaradi. Subtitr o'chirilgan bo'lsa bo'sh
+    lug'at qaytaradi."""
+    if not subtitr_yoqilgan:
+        return {}
+    til_kodi = SUBTITR_TILLARI.get(til_matni, "uz")
+    return {
+        # Ham "asl" (qo'lda yozilgan), ham avtomatik-generatsiya qilingan
+        # subtitrlar sinaladi — ko'p videolarda faqat avtomatik subtitr
+        # mavjud bo'ladi, shu sabab ikkalasi ham yoqilgan.
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["all"] if til_kodi == "all" else [til_kodi, f"{til_kodi}.*"],
+        "subtitlesformat": "srt/best",
+        # Subtitr topilmasa ham yuklash umumiy xato bilan to'xtamasin.
+        "ignore_no_formats_error": True,
+    }
 
 
 # ============================================================
@@ -558,6 +715,25 @@ class VideoYuklovchiOyna(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._yopishni_boshqarish)
         self.after(100, self._navbat_tekshirish)
+        self.after(300, self._bogliqliklarni_tekshirish)
+
+    def _bogliqliklarni_tekshirish(self):
+        """Ishga tushganda ffmpeg va Deno (JS runtime) borligini tekshiradi
+        va yo'q bo'lsa, foydalanuvchini oldindan ogohlantiradi — shunda
+        yuklash paytida tushunarsiz xatoga duch kelmaydi."""
+        if shutil.which("ffmpeg") is None:
+            self._log(
+                "OGOHLANTIRISH: ffmpeg topilmadi. MP3'ga o'tkazish va "
+                "video+audio birlashtirish ishlamaydi. O'rnatish: "
+                "Linux — sudo apt install ffmpeg | Mac — brew install ffmpeg | "
+                "Windows — ffmpeg.org'dan yuklab PATH'ga qo'shing."
+            )
+        if shutil.which("deno") is None:
+            self._log(
+                "OGOHLANTIRISH: Deno topilmadi. YouTube ba'zan formatlarni "
+                "to'liq ko'rsatishi uchun Deno kerak bo'lishi mumkin. "
+                "O'rnatish: curl -fsSL https://deno.land/install.sh | sh"
+            )
 
     # ---------------- UI qurish ----------------
 
@@ -617,8 +793,15 @@ class VideoYuklovchiOyna(tk.Tk):
         self.daftar.add(self.pleylist_tab, text="📋  Pleylist yuklash")
 
         # ---------- Progress + holat + log ----------
-        self.progress = ttk.Progressbar(markaziy, mode="determinate", maximum=100)
-        self.progress.pack(fill=tk.X, pady=(0, 6))
+        progress_lay = ttk.Frame(markaziy)
+        progress_lay.pack(fill=tk.X, pady=(0, 6))
+        self.progress = ttk.Progressbar(progress_lay, mode="determinate", maximum=100)
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.bekor_tugmasi = ttk.Button(
+            progress_lay, text="✕ Bekor qilish", style="Ikkinchi.TButton",
+            state="disabled", command=self._bekor_qilish,
+        )
+        self.bekor_tugmasi.pack(side=tk.LEFT, padx=(8, 0))
 
         self.holat_label = ttk.Label(markaziy, text="Tayyor.")
         self.holat_label.pack(anchor="w", pady=(0, 6))
@@ -671,20 +854,57 @@ class VideoYuklovchiOyna(tk.Tk):
         top.pack(fill=tk.X, pady=(4, 0))
         self.url_maydon = ttk.Entry(top)
         self.url_maydon.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.url_maydon.bind("<Return>", lambda e: self._url_malumot_olish())
         self.sifat_olish_tugmasi = ttk.Button(top, text="Formatlarni olish",
                                                command=self._url_malumot_olish)
         self.sifat_olish_tugmasi.pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(self.url_tab, text="🎚️ Mavjud formatlar", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", pady=(14, 4))
-        self.sifat_combobox = ttk.Combobox(self.url_tab, state="readonly")
-        self.sifat_combobox.pack(fill=tk.X)
+        # ---------- Asosiy (chap) va thumbnail (o'ng) ustunlar ----------
+        govda = ttk.Frame(self.url_tab)
+        govda.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+
+        chap = ttk.Frame(govda)
+        chap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(chap, text="🎚️ Mavjud formatlar", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.sifat_combobox = ttk.Combobox(chap, state="readonly")
+        self.sifat_combobox.pack(fill=tk.X, pady=(4, 12))
+
+        # Yangi funksiya: subtitr (subtitle) yuklab olish imkoniyati.
+        subtitr_lay = ttk.Frame(chap)
+        subtitr_lay.pack(fill=tk.X)
+        self.subtitr_yoqilgan = tk.BooleanVar(value=False)
+        self.subtitr_belgisi = ttk.Checkbutton(
+            subtitr_lay, text="📝 Subtitrlarni ham yuklash", variable=self.subtitr_yoqilgan,
+            command=self._subtitr_holatini_yangilash,
+        )
+        self.subtitr_belgisi.pack(side=tk.LEFT)
+        self.subtitr_til = ttk.Combobox(
+            subtitr_lay, state="disabled", width=18,
+            values=list(SUBTITR_TILLARI.keys()),
+        )
+        self.subtitr_til.set("O'zbek")
+        self.subtitr_til.pack(side=tk.LEFT, padx=(10, 0))
+
+        # ---------- Thumbnail (rasm) oldindan ko'rish ----------
+        self.thumbnail_ramka = ttk.Frame(govda, width=200, height=140)
+        self.thumbnail_ramka.pack(side=tk.LEFT, padx=(16, 0))
+        self.thumbnail_ramka.pack_propagate(False)
+        self.thumbnail_label = ttk.Label(
+            self.thumbnail_ramka, text="Thumbnail\nbu yerda ko'rinadi",
+            anchor="center", justify="center", style="Thumbnail.TLabel",
+        )
+        self.thumbnail_label.pack(fill=tk.BOTH, expand=True)
+        self._thumbnail_rasm = None  # PhotoImage'ga doimiy referens (GC bo'lib ketmasligi uchun)
 
         pastki = ttk.Frame(self.url_tab)
         pastki.pack(fill=tk.X, side=tk.BOTTOM, pady=(14, 0))
         self.yuklash_tugmasi = ttk.Button(pastki, text="⬇️  Yuklab olish", style="Muvaffaqiyat.TButton",
                                            command=self._url_yuklash)
         self.yuklash_tugmasi.pack(side=tk.RIGHT)
+
+    def _subtitr_holatini_yangilash(self):
+        self.subtitr_til.configure(state=("readonly" if self.subtitr_yoqilgan.get() else "disabled"))
 
     def _pleylist_tab_yaratish(self):
         self.pleylist_tab = ttk.Frame(self.daftar, padding=16)
@@ -696,10 +916,25 @@ class VideoYuklovchiOyna(tk.Tk):
         ttk.Label(self.pleylist_tab, text="🎚️ Sifat", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(14, 4))
         self.pleylist_sifat = ttk.Combobox(
             self.pleylist_tab, state="readonly",
-            values=["1080p (Full HD)", "720p (HD)", "480p (O'rta sifat)", "Faqat audio (MP3)"],
+            values=list(PLEYLIST_SIFAT_VARIANTLARI.keys()),
         )
         self.pleylist_sifat.set("720p (HD)")
         self.pleylist_sifat.pack(fill=tk.X)
+
+        subtitr_lay = ttk.Frame(self.pleylist_tab)
+        subtitr_lay.pack(fill=tk.X, pady=(12, 0))
+        self.pleylist_subtitr_yoqilgan = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            subtitr_lay, text="📝 Subtitrlarni ham yuklash", variable=self.pleylist_subtitr_yoqilgan,
+            command=lambda: self.pleylist_subtitr_til.configure(
+                state=("readonly" if self.pleylist_subtitr_yoqilgan.get() else "disabled")
+            ),
+        ).pack(side=tk.LEFT)
+        self.pleylist_subtitr_til = ttk.Combobox(
+            subtitr_lay, state="disabled", width=18, values=list(SUBTITR_TILLARI.keys()),
+        )
+        self.pleylist_subtitr_til.set("O'zbek")
+        self.pleylist_subtitr_til.pack(side=tk.LEFT, padx=(10, 0))
 
         pastki = ttk.Frame(self.pleylist_tab)
         pastki.pack(fill=tk.X, side=tk.BOTTOM, pady=(14, 0))
@@ -742,6 +977,10 @@ class VideoYuklovchiOyna(tk.Tk):
 
         s.configure("Ikkinchi.TButton", background=r["ikkinchi"], foreground=r["fg"])
         s.map("Ikkinchi.TButton", background=[("active", r["ikkinchi_hover"])])
+        s.configure(
+            "Thumbnail.TLabel", background=r["ikkinchi"], foreground=r["fg"],
+            relief="solid", borderwidth=1,
+        )
 
         s.configure("Muvaffaqiyat.TButton", background=r["success"], foreground="#ffffff")
         s.map("Muvaffaqiyat.TButton", background=[("active", r["success_hover"])])
@@ -828,21 +1067,41 @@ class VideoYuklovchiOyna(tk.Tk):
             self.pleylist_tugmasi,
         ):
             tugma.configure(state=holat)
+        # Bekor qilish tugmasi teskari mantiqda: amal ketayotganda yoniq,
+        # hech narsa ishlamayotganda o'chiq.
+        self.bekor_tugmasi.configure(state=("normal" if band else "disabled"))
 
     def _ishchini_ishga_tushirish(self, amal_turi, funksiya, *args):
         """Bitta umumiy usul: fon oqimini yaratadi va boshlaydi. Natijalar
-        self.navbat orqali asosiy oqimga (Tkinter'ga xavfsiz) yetib boradi."""
+        self.navbat orqali asosiy oqimga (Tkinter'ga xavfsiz) yetib boradi.
+        Muvaffaqiyatli boshlangan bo'lsa True, band bo'lgani uchun
+        boshlanmagan bo'lsa False qaytaradi (chaqiruvchi shu asosda
+        holat matnini to'g'ri ko'rsatishi mumkin)."""
         if self.faol_ishchi is not None and self.faol_ishchi.is_alive():
             messagebox.showwarning(
                 "Diqqat", "Hozircha boshqa amal bajarilmoqda. Iltimos, u tugashini kuting."
             )
             return False
         self.joriy_amal = amal_turi
+        bekor_bayrogini_tozalash()
         signallar = Signallar(self.navbat)
         self.faol_ishchi = Ishchi(funksiya, signallar, *args)
         self._tugmalarni_sozlash(True)
+        # Bekor qilish tugmasi faqat haqiqatan bekor qilib bo'ladigan
+        # amallarda (yuklash turlari) yoniladi — qidirish va format
+        # ma'lumotini olish yt-dlp'ning progress_hook'idan foydalanmaydi,
+        # shu sabab ularni "bekor qilish" texnik jihatdan hozircha
+        # ishlamaydi va tugma foydalanuvchini chalg'itmasligi kerak.
+        bekor_qilinadimi = amal_turi in BEKOR_QILINADIGAN_AMALLAR
+        self.bekor_tugmasi.configure(state=("normal" if bekor_qilinadimi else "disabled"))
         self.faol_ishchi.start()
         return True
+
+    def _bekor_qilish(self):
+        if self.faol_ishchi is not None and self.faol_ishchi.is_alive():
+            bekor_qilishni_sorash()
+            self.holat_label.configure(text="Bekor qilinmoqda...")
+            self.bekor_tugmasi.configure(state="disabled")
 
     def _navbat_tekshirish(self):
         """Fon oqimlaridan kelgan xabarlarni davriy tekshiradi va UI'ni
@@ -864,6 +1123,8 @@ class VideoYuklovchiOyna(tk.Tk):
                 elif tur == "sifatlar":
                     malumot_dict, format_variantlari = payload
                     self._sifatlarni_korsat(malumot_dict, format_variantlari)
+                elif tur == "thumbnail":
+                    self._thumbnail_korsat(payload)
                 elif tur == "xato":
                     self._xato_korsat(payload)
                 elif tur == "tugadi":
@@ -890,8 +1151,14 @@ class VideoYuklovchiOyna(tk.Tk):
         soro = self.qidiruv_maydon.get().strip()
         if not soro:
             return
-        self.holat_label.configure(text="Qidirilmoqda...")
-        self._ishchini_ishga_tushirish("qidirish", vazifa_qidirish, soro)
+        # MUHIM XATO TUZATILDI: avval status "Qidirilmoqda..." deb
+        # qo'yilib, keyin _ishchini_ishga_tushirish chaqirilardi — agar
+        # boshqa amal band bo'lsa (False qaytsa), holat matni noto'g'ri
+        # "Qidirilmoqda..." bo'lib qolib ketardi, garchi hech narsa
+        # boshlanmagan bo'lsa ham. Endi status faqat muvaffaqiyatli
+        # boshlanganda o'rnatiladi.
+        if self._ishchini_ishga_tushirish("qidirish", vazifa_qidirish, soro):
+            self.holat_label.configure(text="Qidirilmoqda...")
 
     def _qidiruv_natijalarini_korsat(self, natijalar):
         self.qidiruv_natijalari = natijalar
@@ -940,9 +1207,46 @@ class VideoYuklovchiOyna(tk.Tk):
         if not url:
             messagebox.showwarning("Diqqat", "Avval video havolasini kiriting.")
             return
-        self.holat_label.configure(text="Ma'lumot olinmoqda...")
         self.joriy_url = url
-        self._ishchini_ishga_tushirish("malumot_olish", vazifa_malumot_olish, url)
+        # Thumbnail eski video'dan qolib ketmasligi uchun tozalanadi.
+        self._thumbnail_tozalash()
+        if self._ishchini_ishga_tushirish("malumot_olish", vazifa_malumot_olish, url):
+            self.holat_label.configure(text="Ma'lumot olinmoqda...")
+
+    def _thumbnail_tozalash(self):
+        self.thumbnail_label.configure(image="", text="Thumbnail\nbu yerda ko'rinadi")
+        self._thumbnail_rasm = None
+
+    def _thumbnail_fon_yuklash(self, thumbnail_url):
+        """Fon oqimida ishlaydi: thumbnail rasm baytlarini yt-dlp'siz,
+        oddiy urllib orqali yuklab, self.navbat orqali asosiy oqimga
+        (Tkinter uchun xavfsiz) yuboradi."""
+        try:
+            so_rov = urllib.request.Request(
+                thumbnail_url, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(so_rov, timeout=10) as javob:
+                rasm_baytlari = javob.read()
+            self.navbat.put(("thumbnail", rasm_baytlari))
+        except Exception:
+            self.navbat.put(("thumbnail", None))
+
+    def _thumbnail_korsat(self, rasm_baytlari):
+        if rasm_baytlari is None:
+            self._thumbnail_tozalash()
+            return
+        if not PILLOW_MAVJUD:
+            self.thumbnail_label.configure(
+                image="", text="Thumbnail ko'rish uchun\nquyidagini o'rnating:\npip install pillow"
+            )
+            return
+        try:
+            rasm = Image.open(io.BytesIO(rasm_baytlari))
+            rasm.thumbnail((200, 140))
+            self._thumbnail_rasm = ImageTk.PhotoImage(rasm)
+            self.thumbnail_label.configure(image=self._thumbnail_rasm, text="")
+        except Exception:
+            self._thumbnail_tozalash()
 
     def _sifatlarni_korsat(self, malumot_dict, format_variantlari):
         self.video_malumoti = malumot_dict
@@ -954,6 +1258,15 @@ class VideoYuklovchiOyna(tk.Tk):
         sarlavha = malumot_dict.get("title") or "noma'lum"
         self._log(f"Video topildi: {sarlavha} ({len(format_variantlari) - 2} ta format mavjud)")
         self._tugmalarni_sozlash(False)
+
+        # Yangi funksiya: video thumbnail'ini (rasmini) oldindan ko'rsatish.
+        thumbnail_url = malumot_dict.get("thumbnail")
+        if thumbnail_url:
+            threading.Thread(
+                target=self._thumbnail_fon_yuklash, args=(thumbnail_url,), daemon=True
+            ).start()
+        else:
+            self._thumbnail_tozalash()
 
     def _url_yuklash(self):
         if not self.tanlangan_video_url:
@@ -969,8 +1282,11 @@ class VideoYuklovchiOyna(tk.Tk):
             messagebox.showerror("Xatolik", f"Papka yaratib bo'lmadi: {xato}")
             return
         tanlangan = self.format_variantlari[tanlov_indeks]
+        subtitr_sozlama = _subtitr_ydl_sozlamalarini_yasash(
+            self.subtitr_yoqilgan.get(), self.subtitr_til.get()
+        )
         self._ishchini_ishga_tushirish(
-            "yuklash", vazifa_url_yuklash, self.tanlangan_video_url, tanlangan, papka
+            "yuklash", vazifa_url_yuklash, self.tanlangan_video_url, tanlangan, papka, subtitr_sozlama
         )
 
     # ---------------- 3) Pleylist yuklash ----------------
@@ -986,8 +1302,11 @@ class VideoYuklovchiOyna(tk.Tk):
             messagebox.showerror("Xatolik", f"Papka yaratib bo'lmadi: {xato}")
             return
         sifat_matn = self.pleylist_sifat.get()
+        subtitr_sozlama = _subtitr_ydl_sozlamalarini_yasash(
+            self.pleylist_subtitr_yoqilgan.get(), self.pleylist_subtitr_til.get()
+        )
         self._ishchini_ishga_tushirish(
-            "pleylist_yuklash", vazifa_pleylist_yuklash, url, sifat_matn, papka
+            "pleylist_yuklash", vazifa_pleylist_yuklash, url, sifat_matn, papka, subtitr_sozlama
         )
 
     # ---------------- Oynani yopish ----------------
